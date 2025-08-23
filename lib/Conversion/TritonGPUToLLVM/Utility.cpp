@@ -7,7 +7,12 @@
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/MathExtras.h"
+
+#include <functional>
 
 #if defined(_MSC_VER) && !defined(__clang__)
 // from https://gist.github.com/pps83/3210a2f980fd02bb2ba2e5a1fc4a2ef0
@@ -110,6 +115,7 @@ Value matrixVectorProd(TritonLLVMOpBuilder &b, const LinearLayout &A, Value x) {
   auto nRow = A.getTotalOutDimSizeLog2();
   SmallVector<int32_t> matrix = flatten(A.getBases().begin()->second);
   assert(matrix.size() == nCol);
+
   // We iterate the matrix following the diagonals
   // The idea here is that we want to generate code of the form:
   // \xor_i (x & mask_i) << s_i
@@ -130,14 +136,49 @@ Value matrixVectorProd(TritonLLVMOpBuilder &b, const LinearLayout &A, Value x) {
     return mask;
   };
 
+  uint32_t explicitCols = 0;
+
+  {
+    SmallVector<uint32_t> masks;
+    for (int i = -nRow + 1; i < nCol; i++) {
+      masks.push_back(getMask(i));
+    }
+    bool reachedFixedPoint = false;
+    while (!reachedFixedPoint) {
+      reachedFixedPoint = true;
+      for (uint32_t m : masks) {
+        uint32_t c = m & ~explicitCols;
+        if ((c != 0) && ((c & (c - 1)) == 0)) {
+          // found a single-element diagonal
+          explicitCols |= c;
+          reachedFixedPoint = false;
+        }
+      }
+    }
+  }
+
+  // handle any diagonals that have survived
   Value ret = b.i32_val(0);
   for (int i = -nRow + 1; i < nCol; i++) {
-    auto mask = getMask(i);
+    auto mask = getMask(i) & ~explicitCols;
     if (mask == 0)
       continue;
     auto masked = b.and_(x, b.i32_val(mask));
     ret = b.xor_(ret, i >= 0 ? Value(b.lshr(masked, b.i32_val(i)))
                              : Value(b.shl(masked, b.i32_val(-i))));
+  }
+
+  // handle any explicit columns:
+  Value zero = b.i32_val(0);
+  for (int i = 0; i < nCol; i++) {
+    if ((explicitCols >> i) & 1) {
+      Value bit = b.and_(x, b.i32_val(1 << i));
+      Value bit_is_zero = b.icmp_eq(bit, zero);
+      int32_t basis = matrix[i];
+      if (basis == 0)
+        continue;
+      ret = b.xor_(ret, b.select(bit_is_zero, zero, b.i32_val(basis)));
+    }
   }
   return ret;
 }
@@ -191,42 +232,23 @@ applyLinearLayout(Location loc, RewriterBase &rewriter,
     return outIndices;
   }
 
+  SmallVector<StringAttr> inDimNames;
   // Concatenate input
   Value x = b.i32_val(0);
-  if (nonConstantIns.size() == 1) {
-    x = nonConstantIns[0].second;
-  } else {
-    int shift = 0;
-    for (auto [inDimName, idx] : nonConstantIns) {
-      x = b.or_(x, b.shl(idx, b.i32_val(shift)));
-      shift += layout.getInDimSizeLog2(inDimName);
-    }
+  int shift = 0;
+  for (auto [inDimName, idx] : nonConstantIns) {
+    inDimNames.push_back(inDimName);
+    x = b.or_(x, b.shl(idx, b.i32_val(shift)));
+    shift += layout.getInDimSizeLog2(inDimName);
   }
 
-  // Remove constant input dims from the layout and flatten it
-  auto inDimNames = llvm::to_vector(llvm::make_first_range(nonConstantIns));
-  auto matrix = layout.sublayout(
-      inDimNames, llvm::to_vector(llvm::make_first_range(outIndices)));
-  auto flatMatrix = matrix.flattenIns().flattenOuts();
-
-  // Lower the matrix-vector product
-  auto out = triton::gpu::matrixVectorProd(b, flatMatrix, x);
-
-  // Unpack the output
-  if (matrix.getNumOutDims() == 1) {
-    outIndices[0].second = b.xor_(outIndices[0].second, out);
-  } else {
-    assert(llvm::equal(matrix.getOutDimNames(),
-                       llvm::make_first_range(outIndices)));
-    int shift = 0;
-    for (auto &[dimName, outIdx] : outIndices) {
-      auto outDimSizeLog2 = layout.getOutDimSizeLog2(dimName);
-      auto mask = (1 << outDimSizeLog2) - 1;
-      outIdx = b.xor_(outIdx,
-                      b.and_(b.lshr(out, b.i32_val(shift)), b.i32_val(mask)));
-      shift += outDimSizeLog2;
-    }
+  for (auto &[outDimName, outIdx] : outIndices) {
+    // Apply flattened sublayout for this output
+    auto matrix = layout.sublayout(inDimNames, outDimName).flattenIns();
+    auto out = triton::gpu::matrixVectorProd(b, matrix, x);
+    outIdx = b.xor_(outIdx, out);
   }
+
   return outIndices;
 }
 
@@ -256,22 +278,25 @@ Value getThreadId(OpBuilder &rewriter, Location loc) {
       rewriter.create<::mlir::gpu::ThreadIdOp>(loc, ::mlir::gpu::Dimension::x);
   tid = rewriter.create<arith::IndexCastOp>(loc, i32_ty, tid);
 
+  Operation *lookupPt = &rewriter.getInsertionBlock()->front();
+  int threadsPerWarp = triton::gpu::lookupThreadsPerWarp(rewriter);
+  int numWarps = triton::gpu::lookupNumWarps(lookupPt);
+  int upperBound = numWarps * threadsPerWarp;
+
+  TritonLLVMOpBuilder b(loc, rewriter);
+
   // If this is being created inside a warp specialize op, compute the relative
   // thread ID within the warp group.
   if (std::optional<int> startId =
           getWarpGroupStartThreadId(rewriter.getInsertionBlock())) {
-    TritonLLVMOpBuilder b(loc, rewriter);
     tid = rewriter.create<arith::SubIOp>(loc, tid, b.i32_val(*startId));
   }
 
-  return tid;
-}
+  assert(llvm::isPowerOf2_32(upperBound));
+  // help LLVM's known bits analysis:
+  tid = b.and_(tid, b.i32_val(upperBound - 1));
 
-Value getLaneId(OpBuilder &rewriter, Location loc) {
-  TritonLLVMOpBuilder b(loc, rewriter);
-  Value tid = getThreadId(rewriter, loc);
-  int threadsPerWarp = triton::gpu::lookupThreadsPerWarp(rewriter);
-  return b.urem(tid, b.i32_val(threadsPerWarp));
+  return tid;
 }
 
 std::pair<Value, Value> getLaneAndWarpId(OpBuilder &rewriter, Location loc) {
@@ -279,19 +304,73 @@ std::pair<Value, Value> getLaneAndWarpId(OpBuilder &rewriter, Location loc) {
   Value tid = getThreadId(rewriter, loc);
   int threadsPerWarp = triton::gpu::lookupThreadsPerWarp(rewriter);
   Value warpSizeVal = b.i32_val(threadsPerWarp);
-  Value laneId = b.urem(tid, warpSizeVal);
 
   // If there is only one warp, the warp ID is always 0.
   Operation *lookupPt = &rewriter.getInsertionBlock()->front();
+  Value laneId;
   Value warpId;
-  if (triton::gpu::lookupNumWarps(lookupPt) == 1)
+  if (triton::gpu::lookupNumWarps(lookupPt) == 1) {
+    laneId = tid;
     warpId = b.i32_val(0);
-  else
+  } else {
+    laneId = b.urem(tid, warpSizeVal);
     warpId = b.udiv(tid, warpSizeVal);
+  }
 
   return {laneId, warpId};
 }
 
+Value getLaneId(OpBuilder &rewriter, Location loc) {
+  return getLaneAndWarpId(rewriter, loc).first;
+}
+
+// Helper function: applies linear layout vectorized over register indices
+SmallVector<SmallVector<std::pair<StringAttr, Value>>>
+applyLinearLayoutVec(Location loc, RewriterBase &rewriter,
+                     const LinearLayout &layout,
+                     ArrayRef<std::pair<StringAttr, Value>> indices,
+                     ArrayRef<uint32_t> registers) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  MLIRContext *ctx = rewriter.getContext();
+
+  StringAttr kRegister = str_attr("register");
+
+  // Precompute the base (with register = 0)
+  SmallVector<std::pair<StringAttr, Value>> indicesWithZeroReg;
+  for (const auto &[attr, val] : indices) {
+    if (attr == kRegister)
+      indicesWithZeroReg.emplace_back(attr, b.i32_val(0));
+    else
+      indicesWithZeroReg.emplace_back(attr, val);
+  }
+
+  auto baseIndices =
+      applyLinearLayout(loc, rewriter, layout, indicesWithZeroReg);
+
+  SmallVector<SmallVector<std::pair<StringAttr, Value>>> ret;
+
+  // Iterate over registers, applying XOR trick
+  for (auto reg : registers) {
+    SmallVector<std::pair<StringAttr, int32_t>> constRegIndices;
+    for (const auto &[attr, val] : indices) {
+      constRegIndices.emplace_back(attr, attr == kRegister ? reg : 0);
+    }
+    auto regIndices = layout.apply(constRegIndices);
+
+    SmallVector<std::pair<StringAttr, Value>> combinedIndices;
+    for (auto [base, regIdx] : llvm::zip(baseIndices, regIndices)) {
+      assert(base.first == regIdx.first);
+      Value combined = b.xor_(base.second, b.i32_val(regIdx.second));
+      combinedIndices.emplace_back(base.first, combined);
+    }
+
+    ret.push_back(combinedIndices);
+  }
+
+  return ret;
+}
+
+// Refactored emitIndices function using applyLinearLayoutVec
 SmallVector<SmallVector<Value>>
 emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
             Attribute layout, RankedTensorType type, bool withCTAOffset) {
@@ -301,8 +380,6 @@ emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
 
   LinearLayout ll = triton::gpu::toLinearLayout(shape, layout);
 
-  // TODO(jlebar): We could add strong typing if we wanted; for now this is
-  // "stringly typed".
   StringAttr kRegister = str_attr("register");
   StringAttr kLane = str_attr("lane");
   StringAttr kWarp = str_attr("warp");
@@ -311,52 +388,58 @@ emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
   auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
   Value blockId =
       withCTAOffset ? target.getClusterCTAId(rewriter, loc) : b.i32_val(0);
+
+  SmallVector<std::pair<StringAttr, Value>> commonIndices = {
+      {kRegister, b.i32_val(0)},
+      {kLane, laneId},
+      {kWarp, warpId},
+      {kBlock, blockId}};
+
+  // Vectorize over registers
+  SmallVector<uint32_t> registerIndices;
+  for (unsigned reg = 0; reg < ll.getInDimSize(kRegister); ++reg)
+    registerIndices.push_back(reg);
+
+  auto vecIndices =
+      applyLinearLayoutVec(loc, rewriter, ll, commonIndices, registerIndices);
+
   unsigned rank = shape.size();
   SmallVector<SmallVector<Value>> ret;
-  // Linear layout function is split in two parts below:
-  // L(r, t, w, b) = L(0, t, w, b) xor L(r, 0, 0, 0)
-  //     idxs      =    idxsBase   xor    idxsReg
-  //
-  // L(0, t, w, b) part is the same for all registers,
-  // so we hoist it out of the main register loop in the below.
-  //
-  // This approach produces code with lower register pressure and
-  // less computations, compared to fused L(r,t,w,b) method.
-  auto idxsBase = applyLinearLayout(loc, rewriter, ll,
-                                    {{kRegister, b.i32_val(0)},
-                                     {kLane, laneId},
-                                     {kWarp, warpId},
-                                     {kBlock, blockId}});
-  for (unsigned reg = 0; reg < ll.getInDimSize(str_attr("register")); reg++) {
-    auto idxsReg =
-        ll.apply({{kRegister, reg}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
-    SmallVector<std::pair<StringAttr, Value>> idxs;
-    for (auto [idxBase, idxReg] : llvm::zip(idxsBase, idxsReg)) {
-      auto dimName = idxBase.first;
-      assert(dimName == idxReg.first &&
-             "dim names of block+warp+thread and register idx should be equal");
-      auto idx = b.xor_(idxBase.second, b.i32_val(idxReg.second));
-      idxs.emplace_back(dimName, idx);
-    }
-    assert(idxs.size() == rank);
-    for (unsigned k = 0; k < rank; ++k) {
-      assert(idxs[k].first == str_attr("dim" + std::to_string(k)));
-    }
-    ret.push_back(llvm::to_vector(llvm::make_second_range(idxs)));
+  for (auto &indices : vecIndices) {
+    SmallVector<Value> vals;
+    assert(indices.size() == rank);
+    for (auto &idx : indices)
+      vals.push_back(idx.second);
+    ret.push_back(vals);
   }
 
   return ret;
 }
 
+Value emitPadding(Location loc, RewriterBase &rewriter,
+                  triton::gpu::PaddedSharedEncodingAttr layout,
+                  Value smemOffset) {
+  TritonLLVMOpBuilder b(loc, rewriter);
+
+  Value padOffset = b.i32_val(0);
+  for (auto [interval, padding] :
+       llvm::zip_equal(layout.getIntervals(), layout.getPaddings())) {
+    Value iVal = b.i32_val(llvm::Log2_32(interval));
+    Value pVal = b.i32_val(llvm::Log2_32(padding));
+    padOffset = b.add(padOffset, b.shl(b.ashr(smemOffset, iVal), pVal));
+  }
+  return padOffset;
+}
+
 namespace {
 
-Value getSmemVecAddr(const LinearLayout &regLayout,
-                     const LinearLayout &regToSharedLayout,
-                     const LinearLayout &invertAllocSharedLayout,
-                     const SharedMemoryObject &smemObj,
-                     triton::gpu::MemDescType sharedTy, Type elemLlvmTy,
-                     Value regId, Value laneId, Value warpId, Value blockId,
-                     Location loc, RewriterBase &rewriter) {
+SmallVector<Value> getSmemVecAddrVec(
+    const LinearLayout &regLayout, const LinearLayout &regToSharedLayout,
+    const LinearLayout &invertAllocSharedLayout,
+    const SharedMemoryObject &smemObj, triton::gpu::MemDescType sharedTy,
+    Type elemLlvmTy, ArrayRef<uint32_t> regIds, Value laneId, Value warpId,
+    Value blockId, Location loc, RewriterBase &rewriter) {
+
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   MLIRContext *ctx = rewriter.getContext();
   StringAttr kBlock = str_attr("block");
@@ -372,7 +455,10 @@ Value getSmemVecAddr(const LinearLayout &regLayout,
   auto smemBase = smemObj.getBase();
   auto smemOffsets = smemObj.getOffsets();
   auto smemStrides = smemObj.getStrides(sharedTy, loc, rewriter);
-  Value smemOffset;
+
+  SmallVector<Value> smemOffsetsComputed;
+  SmallVector<SmallVector<std::pair<StringAttr, Value>>> indicesVec;
+
   // When loading or storing to shared memory, we consider two cases for
   // performance reasons:
   //
@@ -403,33 +489,62 @@ Value getSmemVecAddr(const LinearLayout &regLayout,
   // We propose case 2 (see comments below), which provides a more general
   // solution for all swizzled shared memory scenarios, including the edge case
   // mentioned above.
+  //
+  // Padded shared layout falls into case 1--we can rely on the logic for case 1
+  // to get the 1-D offset into shared memory. Then we just need to add the
+  // padding offset.
   if (isSimpleSharedMemoryAccess(shape, allocShape, sharedEnc)) { // Case 1
-    smemOffset = applyLinearLayout(loc, rewriter, regToSharedLayout,
-                                   {{kRegister, regId},
-                                    {kLane, laneId},
-                                    {kWarp, warpId},
-                                    {kBlock, blockId}})[0]
-                     .second;
+
     // This reverts #5645, because it introduced increased register pressure in
     // AMD backend.
     // TODO: remove when new implementation performance reaches target level
     if (auto swizzledSharedEnc =
             mlir::dyn_cast<triton::gpu::SwizzledSharedEncodingAttr>(
                 sharedEnc)) {
-      auto regToSharedLayout =
+      auto regToSharedSwizzledLayout =
           getRegToSharedLayout(ctx, shape, regLayout, swizzledSharedEnc,
                                elemLlvmTy.getIntOrFloatBitWidth());
       auto smemOrder = swizzledSharedEnc.getOrder();
-      smemOffsets = llvm::to_vector(llvm::drop_end(llvm::make_second_range(
-          applyLinearLayout(loc, rewriter, regToSharedLayout,
-                            {{kRegister, regId},
-                             {kLane, laneId},
-                             {kWarp, warpId},
-                             {kBlock, b.i32_val(0)}}))));
-      // Reorder strides according to `order`.  This way they match the
-      // multi-dimensional offsets in regToSharedLayout.
-      smemOffset = dot(rewriter, loc, smemOffsets,
-                       applyPermutation(smemStrides, smemOrder));
+
+      auto swizzledIndicesVec =
+          applyLinearLayoutVec(loc, rewriter, regToSharedSwizzledLayout,
+                               {{kRegister, b.i32_val(0)},
+                                {kLane, laneId},
+                                {kWarp, warpId},
+                                {kBlock, b.i32_val(0)}},
+                               regIds);
+
+      auto reorderedStrides = applyPermutation(smemStrides, smemOrder);
+
+      for (auto &swizzledIndices : swizzledIndicesVec) {
+        SmallVector<Value> swizzledOffsets;
+        for (unsigned i = 0; i < swizzledIndices.size() - 1; ++i)
+          swizzledOffsets.push_back(swizzledIndices[i].second);
+
+        Value smemOffset =
+            dot(rewriter, loc, swizzledOffsets, reorderedStrides);
+        smemOffsetsComputed.push_back(smemOffset);
+      }
+    } else {
+      auto indicesVec = applyLinearLayoutVec(loc, rewriter, regToSharedLayout,
+                                             {{kRegister, b.i32_val(0)},
+                                              {kLane, laneId},
+                                              {kWarp, warpId},
+                                              {kBlock, blockId}},
+                                             regIds);
+
+      for (auto &indices : indicesVec) {
+        Value smemOffset = indices[0].second;
+
+        if (auto paddedLayout =
+                dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(sharedEnc)) {
+          // Apply the offset needed for padding.
+          Value padOffset =
+              emitPadding(loc, rewriter, paddedLayout, smemOffset);
+          smemOffset = b.add(smemOffset, padOffset);
+        }
+        smemOffsetsComputed.push_back(smemOffset);
+      }
     }
   } else { // Case 2 -> rank-reduced swizzling
     assert(rank >= 2 && "Swizzling only applies to tensors with rank >= 2");
@@ -460,39 +575,217 @@ Value getSmemVecAddr(const LinearLayout &regLayout,
     // This approach ensures that "absolute" tensor offsets can be
     // mapped to the correct shared memory addresses using
     // `invertAllocSharedLayout`.
-    auto multiDimTensorOffsets =
-        llvm::to_vector(applyLinearLayout(loc, rewriter, regLayout,
-                                          {{kRegister, regId},
-                                           {kLane, laneId},
-                                           {kWarp, warpId},
-                                           {kBlock, blockId}}));
-    for (auto i = 0; i < rank; i++) {
-      multiDimTensorOffsets[i].second =
-          b.add(multiDimTensorOffsets[i].second, smemOffsets[i]);
+
+    auto composedLayout = regLayout.compose(invertAllocSharedLayout);
+
+    auto indicesVec = applyLinearLayoutVec(loc, rewriter, composedLayout,
+                                           {{kRegister, b.i32_val(0)},
+                                            {kLane, laneId},
+                                            {kWarp, warpId},
+                                            {kBlock, blockId}},
+                                           regIds);
+
+    SmallVector<std::pair<StringAttr, Value>> smemOffsetPairs;
+    for (auto [attr, val] :
+         llvm::zip(invertAllocSharedLayout.getInDimNames(), smemOffsets)) {
+      smemOffsetPairs.emplace_back(attr, val);
     }
-    smemOffset = applyLinearLayout(loc, rewriter, invertAllocSharedLayout,
-                                   multiDimTensorOffsets)[0]
-                     .second;
+    Value smemOffsetsApplied =
+        applyLinearLayout(loc, rewriter, invertAllocSharedLayout,
+                          smemOffsetPairs)[0]
+            .second;
+
     Value baseToAllocBaseDist = dot(rewriter, loc, smemOffsets, smemStrides);
-    smemOffset = b.sub(smemOffset, baseToAllocBaseDist);
+
+    for (auto &indices : indicesVec) {
+      Value smemOffset = indices[0].second;
+      smemOffset = b.xor_(smemOffset, smemOffsetsApplied);
+      smemOffset = b.sub(smemOffset, baseToAllocBaseDist);
+      smemOffsetsComputed.push_back(smemOffset);
+    }
   }
-  auto ptrTy = smemBase.getType();
-  auto vecAddr = b.gep(ptrTy, elemLlvmTy, smemBase, smemOffset,
-                       LLVM::GEPNoWrapFlags::inbounds);
-  return vecAddr;
+
+  SmallVector<Value> smemVecAddrs;
+  for (auto smemOffset : smemOffsetsComputed) {
+    auto vecAddr = b.gep(smemBase.getType(), elemLlvmTy, smemBase, smemOffset,
+                         LLVM::GEPNoWrapFlags::inbounds);
+    smemVecAddrs.push_back(vecAddr);
+  }
+
+  return smemVecAddrs;
 }
 
+std::pair<int, ColumnAction>
+largestVectorisation(MLIRContext *ctx, const LinearLayout &cvt, int bitwidth,
+                     std::optional<int> maybeMaxVecElems = std::nullopt) {
+  // Find the largest vectorisation we can use:
+  StringAttr kReg = str_attr("register");
+  StringAttr kOffset = str_attr("offset");
+  LinearLayout quot;
+  LinearLayout tile;
+  ColumnAction permutation;
+  // If there are restrictions on the vectorisation, we don't allow
+  // permutations.
+  auto allowPerm = !maybeMaxVecElems.has_value();
+  auto maxVecElems = maybeMaxVecElems.value_or(128 / bitwidth);
+  for (int v = maxVecElems; v >= 1; v /= 2) {
+    tile = LinearLayout::identity1D(v, kReg, kOffset);
+    auto maybePerm = regPermForDivide(cvt, tile, /*left=*/true);
+    if (!maybePerm) {
+      continue;
+    }
+    permutation = *maybePerm;
+    if (!allowPerm && !permutation.isIdentity()) {
+      continue;
+    }
+    auto newCvt = permutation.apply(cvt);
+    auto maybeQuot = divideLeft(newCvt, tile);
+    if (!maybeQuot) {
+      continue;
+    }
+    return {v, permutation};
+  }
+  llvm_unreachable("No vectorisation found");
+}
 } // namespace
 
-bool emitTransferBetweenRegistersAndShared(
-    LinearLayout &regLayout, triton::gpu::MemDescType sharedTy, Type elemLlvmTy,
-    std::optional<int32_t> maxVecElems, const SharedMemoryObject &smemObj,
-    Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
-    std::function<void(VectorType, Value /*shmemAddr*/)> perVectorCallback) {
+SmallVector<Value>
+lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
+                ArrayRef<Value> valsArray, // Input for store, output for load
+                Type llvmElemTy, Value smemBase,
+                ConversionPatternRewriter &rewriter,
+                const TargetInfoBase &targetInfo) {
+
+  bool isStore = !valsArray.empty();
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+
+  auto emitCpAsync = [&](ConversionPatternRewriter &rewriter, Location loc,
+                         ArrayRef<Value> vals, Value shmemAddr, int idx,
+                         VectorType vecTy) -> SmallVector<Value> {
+    auto length = vecTy.getNumElements();
+    if (isStore) {
+      Value valsVec =
+          packLLVector(loc, ArrayRef<Value>(vals).slice(idx, length), rewriter);
+      targetInfo.storeDShared(rewriter, loc, shmemAddr, std::nullopt, valsVec,
+                              /*pred=*/b.true_val());
+      return {};
+    } else {
+      assert(vals.empty());
+      Value valsVec = targetInfo.loadDShared(
+          rewriter, loc, shmemAddr, std::nullopt, vecTy, /*pred=*/b.true_val());
+      return unpackLLVector(loc, valsVec, rewriter);
+    }
+  };
+  return lowerLdSt(loc, ctx, cvt, valsArray, llvmElemTy, smemBase, rewriter,
+                   targetInfo, {}, emitCpAsync);
+}
+
+SmallVector<Value> lowerLdSt(
+    Location loc, MLIRContext *ctx, LinearLayout cvt,
+    ArrayRef<Value> valsArray, // Input for store, output for load
+    Type llvmElemTy, Value smemBase, ConversionPatternRewriter &rewriter,
+    const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems,
+    std::function<SmallVector<Value>(ConversionPatternRewriter &, Location,
+                                     ArrayRef<Value>, Value, int, VectorType)>
+        lowerInst) {
+  auto vals = to_vector(valsArray);
+  bool isStore = !vals.empty();
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  auto smemPtrTy = ptr_ty(ctx, 3);
+  auto kReg = str_attr("register");
+  auto kLane = str_attr("lane");
+  auto kWarp = str_attr("warp");
+  auto kOffset = str_attr("offset");
+  auto bitwidth = llvmElemTy.getIntOrFloatBitWidth();
+
+  auto [elemsPerVec, permutation] =
+      largestVectorisation(ctx, cvt, bitwidth, maybeMaxVecElems);
+
+  cvt = permutation.apply(cvt);
+  if (isStore) {
+    vals = permutation.apply(vals);
+  }
+
+  auto tile = LinearLayout::identity1D(elemsPerVec, kReg, kOffset);
+  auto quot = *divideLeft(cvt, tile);
+  LinearLayout reps = zerosLike(tile) * quot;
+
+  auto [nAdditive, permStrides] = actionAdditiveStrides(reps);
+  reps = permStrides.apply(reps);
+  if (isStore) {
+    vals = permStrides.apply(vals);
+  }
+
+  // PTX expects the address increments to be done in bytes
+  // If we don't perform the computations in i8, the compiler would
+  // have to divide the computation by bitwdith / 8 and then lift this
+  // shl, which often it's not able to do.
+  auto i8Tile =
+      zerosLike(LinearLayout::identity1D(bitwidth / 8, kReg, kOffset));
+  auto i8Reps = i8Tile * reps;
+
   auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
-  return emitTransferBetweenRegistersAndShared(
-      regLayout, sharedTy, elemLlvmTy, maxVecElems, smemObj, loc, rewriter,
-      target, laneId, warpId, perVectorCallback);
+  auto regBaseI8 =
+      applyLinearLayout(
+          loc, rewriter, i8Reps,
+          {{kReg, b.i32_val(0)}, {kLane, laneId}, {kWarp, warpId}})[0]
+          .second;
+  SmallVector<Value> outVals;
+  auto vecTy = vec_ty(llvmElemTy, elemsPerVec);
+  for (int i = 0; i < cvt.getInDimSize(kReg); i += nAdditive) {
+    auto regIdx = reps.apply({{kReg, i}, {kLane, 0}, {kWarp, 0}})[0].second;
+    auto regIdxI8 = regIdx * (bitwidth / 8);
+    Value offset = b.xor_(regBaseI8, b.i32_val(regIdxI8));
+    for (int j = 0; j < nAdditive; j += elemsPerVec) {
+      // all these constants will go as immediate values to LDS/STS
+      auto regIdxAdd =
+          reps.apply({{kReg, j}, {kLane, 0}, {kWarp, 0}})[0].second;
+      auto regIdxAddI8 = regIdxAdd * (bitwidth / 8);
+      Value innerOffset = b.add(offset, b.i32_val(regIdxAddI8));
+      auto vecAddr = b.gep(smemPtrTy, i8_ty, smemBase, innerOffset,
+                           LLVM::GEPNoWrapFlags::inbounds);
+      llvm::append_range(outVals,
+                         lowerInst(rewriter, loc, vals, vecAddr, i + j, vecTy));
+    }
+  }
+
+  // Permute the values back if we are loading
+  if (!isStore) {
+    auto invPermStrides = permStrides.inverse();
+    outVals = invPermStrides.apply(outVals);
+    auto invPerm = permutation.inverse();
+    outVals = invPerm.apply(outVals);
+  }
+  return outVals;
+}
+
+SmallVector<Value> lowerLocalLdSt(Location loc, MLIRContext *ctx,
+                                  LinearLayout cvt, ArrayRef<Value> valsArray,
+                                  // Input for store, output for load
+                                  Type llvmElemTy, Value smemBase,
+                                  ConversionPatternRewriter &rewriter,
+                                  const TargetInfoBase &targetInfo) {
+  assert(cvt.getNumOutDims() == 1);
+  assert(*cvt.getOutDimNames().begin() == str_attr("offset"));
+  auto isStore = !valsArray.empty();
+  // Remove broadcasting in the registers
+  auto removeBroadcastSrc = actionRemoveBroadcastedRegs(cvt);
+  if (!removeBroadcastSrc.isIdentity()) {
+    auto prmtCvt = removeBroadcastSrc.apply(cvt);
+    auto inVals = to_vector(valsArray);
+    if (isStore) {
+      inVals = removeBroadcastSrc.apply(inVals);
+    }
+    auto outVals = lowerLdStShared(loc, ctx, prmtCvt, inVals, llvmElemTy,
+                                   smemBase, rewriter, targetInfo);
+    if (!isStore) {
+      outVals = broadcastAs(outVals, cvt);
+    }
+    return outVals;
+  }
+
+  return lowerLdStShared(loc, ctx, cvt, valsArray, llvmElemTy, smemBase,
+                         rewriter, targetInfo);
 }
 
 bool emitTransferBetweenRegistersAndShared(
@@ -508,11 +801,19 @@ bool emitTransferBetweenRegistersAndShared(
   StringAttr kRegister = str_attr("register");
   StringAttr kLane = str_attr("lane");
   StringAttr kWarp = str_attr("warp");
+  StringAttr kOffset = str_attr("offset");
 
   auto shape = sharedTy.getShape();
-  LinearLayout sharedLayout =
-      triton::gpu::toLinearLayout(shape, sharedTy.getEncoding());
-  LinearLayout regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
+  auto paddedLayout =
+      dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(sharedTy.getEncoding());
+  LinearLayout regToSharedLayout = LinearLayout::empty();
+  if (paddedLayout) {
+    regToSharedLayout =
+        regLayout.reshapeOuts({{kOffset, regLayout.getTotalOutDimSize()}});
+  } else {
+    auto sharedLL = triton::gpu::toLinearLayout(shape, sharedTy.getEncoding());
+    regToSharedLayout = regLayout.invertAndCompose(sharedLL);
+  }
 
   // TODO(jlebar): We don't currently support loading from shared memory in a
   // different CTA.  We'd need to emit `mapa.shared::cluster` instructions.
@@ -537,9 +838,12 @@ bool emitTransferBetweenRegistersAndShared(
   //
   // It's OK if the vector width we choose here is wider than the hardware
   // supports; LLVM will legalize it.
-  const int vecElems =
-      std::min(regToSharedLayout.getNumConsecutiveInOut(),
-               maxVecElems.value_or(std::numeric_limits<int>::max()));
+  int vecElems =
+      std::min({regToSharedLayout.getNumConsecutiveInOut(),
+                maxVecElems.value_or(std::numeric_limits<int>::max())});
+  if (paddedLayout) {
+    vecElems = std::min(vecElems, int(paddedLayout.getMinInterval()));
+  }
 
   auto withCTAOffset = triton::gpu::getNumCTAs(sharedTy.getEncoding()) > 1;
   Value blockId =
@@ -553,19 +857,25 @@ bool emitTransferBetweenRegistersAndShared(
   // take out the "block" dimension.
   // Thus we use `pseudoinvert` instead of `invert` here for simplicity.
   auto allocShape = sharedTy.getAllocShape();
-  LinearLayout invertAllocSharedLayout =
-      triton::gpu::toLinearLayout(allocShape.take_back(sharedTy.getRank()),
-                                  sharedTy.getEncoding())
-          .pseudoinvert();
+  auto invertAllocSharedLayout = LinearLayout::empty();
+  if (!paddedLayout) {
+    // For now this is only needed for the cases where we have swizzling.
+    invertAllocSharedLayout =
+        triton::gpu::toLinearLayout(allocShape.take_back(sharedTy.getRank()),
+                                    sharedTy.getEncoding())
+            .pseudoinvert();
+  }
 
   int numElems = regToSharedLayout.getInDimSize(kRegister);
   auto vecTy = vec_ty(elemLlvmTy, vecElems);
-  SmallVector<Value> ret;
+  SmallVector<uint32_t> regIds;
   for (int i = 0; i < numElems / vecElems; i++) {
-    auto regId = b.i32_val(i * vecElems);
-    auto vecAddr = getSmemVecAddr(
-        regLayout, regToSharedLayout, invertAllocSharedLayout, smemObj,
-        sharedTy, elemLlvmTy, regId, laneId, warpId, blockId, loc, rewriter);
+    regIds.push_back(i * vecElems);
+  }
+  auto vecAddrVec = getSmemVecAddrVec(
+      regLayout, regToSharedLayout, invertAllocSharedLayout, smemObj, sharedTy,
+      elemLlvmTy, regIds, laneId, warpId, blockId, loc, rewriter);
+  for (Value &vecAddr : vecAddrVec) {
     perVectorCallback(vecTy, vecAddr);
   }
   return true;
@@ -579,9 +889,10 @@ bool emitTransferBetweenRegistersAndShared(
     std::function<void(VectorType, Value /*shmemAddr*/)> perVectorCallback) {
   auto regLayout = triton::gpu::toLinearLayout(registerTy.getShape(),
                                                registerTy.getEncoding());
+  auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
   return emitTransferBetweenRegistersAndShared(
       regLayout, sharedTy, elemLlvmTy, maxVecElems, smemObj, loc, rewriter,
-      target, perVectorCallback);
+      target, laneId, warpId, perVectorCallback);
 }
 
 SmallVector<Value> loadSharedToDistributed(triton::gpu::LocalLoadOp localLoadOp,
@@ -617,8 +928,7 @@ void storeDistributedToShared(triton::gpu::MemDescType dstTy,
                               ArrayRef<Value> srcVals,
                               const SharedMemoryObject &smemObj, Location loc,
                               RewriterBase &rewriter,
-                              const TargetInfoBase &target,
-                              std::pair<size_t, Type> *const llvmOpCount) {
+                              const TargetInfoBase &target) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   bool success = emitTransferBetweenRegistersAndShared(
       srcTy, dstTy, elemLlvmTy, /*maxVecElems=*/std::nullopt, smemObj, loc,
@@ -633,10 +943,6 @@ void storeDistributedToShared(triton::gpu::MemDescType dstTy,
         b.store(vec, vecAddr)
             .setAlignment(vecTy.getNumElements() *
                           elemLlvmTy.getIntOrFloatBitWidth() / 8);
-        if (llvmOpCount) {
-          ++(llvmOpCount->first);
-          llvmOpCount->second = vecTy;
-        }
       });
 
   if (!success)
@@ -769,10 +1075,13 @@ bool isSimpleSharedMemoryAccess(ArrayRef<int64_t> shape,
                                 ArrayRef<int64_t> allocShape,
                                 triton::gpu::SharedEncodingTrait sharedEnc) {
   auto rank = shape.size();
+  auto paddedLayout =
+      dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(sharedEnc);
   auto swizzledLayout =
       dyn_cast<triton::gpu::SwizzledSharedEncodingAttr>(sharedEnc);
   auto nvmmaLayout = dyn_cast<triton::gpu::NVMMASharedEncodingAttr>(sharedEnc);
-  bool noSwizzling = (swizzledLayout && swizzledLayout.getMaxPhase() == 1) ||
+  bool noSwizzling = paddedLayout ||
+                     (swizzledLayout && swizzledLayout.getMaxPhase() == 1) ||
                      (nvmmaLayout && nvmmaLayout.getSwizzlingByteWidth() == 0);
   return /*no swizzling*/ noSwizzling ||
          /*swizzling but same shape*/ shape == allocShape ||

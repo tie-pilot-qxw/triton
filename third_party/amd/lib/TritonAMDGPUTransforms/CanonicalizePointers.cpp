@@ -1,8 +1,4 @@
-/*
- * Modification Copyright 2025 ByteDance Ltd. and/or its affiliates.
- */
 #include "TritonAMDGPUTransforms/Passes.h"
-#include "TritonDistributed/Dialect/Distributed/IR/Dialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
@@ -460,41 +456,6 @@ struct PointerCanonicalizationPattern : ConversionPattern {
   llvm::SetVector<Operation *> &opToRewrite;
 };
 
-/// distributed dialect extension
-class ConvertConsumeToken : public PointerCanonicalizationPattern<
-                                triton::distributed::ConsumeTokenOp> {
-public:
-  using PointerCanonicalizationPattern::PointerCanonicalizationPattern;
-
-  LogicalResult
-  matchAndRewrite_(triton::distributed::ConsumeTokenOp consumeTokenOp,
-                   OneToNOpAdaptor adaptor,
-                   ConversionPatternRewriter &rewriter) const override {
-    ValueRange remappedOperands = adaptor.getInput();
-    if (remappedOperands.size() != 2) {
-      return success();
-    }
-    Value fatPtrBase = remappedOperands[0];
-    Value fatPtrOffset = remappedOperands[1];
-    if (!llvm::isa<tt::PointerType>(fatPtrBase.getType()))
-      return rewriter.notifyMatchFailure(consumeTokenOp,
-                                         "non tt.ptr base unimplemented");
-
-    // ConsumeTokenOp is just to build data dependencies.
-    // Here, we replace the input(may be tensor ptr) with base ptr without any
-    // impact.
-    triton::distributed::ConsumeTokenOp newConsumeTokenOp =
-        rewriter.create<triton::distributed::ConsumeTokenOp>(
-            consumeTokenOp->getLoc(), fatPtrBase, adaptor.getToken()[0]);
-    rewriter.replaceOpWithMultiple(consumeTokenOp,
-                                   {{newConsumeTokenOp, fatPtrOffset}});
-    fatPtrs[{newConsumeTokenOp, fatPtrOffset}] =
-        fatPtrs.at({fatPtrBase, fatPtrOffset});
-
-    return success();
-  }
-};
-
 /// splat integer offset, keep base
 class ConvertSplatOp : public PointerCanonicalizationPattern<tt::SplatOp> {
 public:
@@ -606,6 +567,14 @@ public:
                                            "tt.constancy"};
     SmallVector<NamedAttribute> propagatedAttrs =
         tt::filterDiscardableAttrs(addPtrOp.getOperation(), propagateList);
+    auto currPtrTy = llvm::dyn_cast<RankedTensorType>(addPtrOp.getType());
+    int currPtrRank = currPtrTy ? currPtrTy.getRank() : 1;
+    auto doSetDiscardableAttrs = [&](tt::AddPtrOp newAddPtrOp) {
+      auto newPtrTy = llvm::dyn_cast<RankedTensorType>(newAddPtrOp.getType());
+      int newPtrRank = newPtrTy ? newPtrTy.getRank() : 1;
+      if (newPtrRank == currPtrRank)
+        newAddPtrOp->setDiscardableAttrs(propagatedAttrs);
+    };
 
     // If it is a scalar pointer update, simply bump the base pointer
     if (llvm::isa<tt::PointerType>(addPtrOp.getPtr().getType())) {
@@ -613,7 +582,7 @@ public:
              "expected offset to be integer type");
       auto newAddPtrOp = rewriter.create<tt::AddPtrOp>(
           curLoc, fatPtrBase.getType(), fatPtrBase, origOffset);
-      newAddPtrOp->setDiscardableAttrs(propagatedAttrs);
+      doSetDiscardableAttrs(newAddPtrOp);
 
       rewriter.replaceOpWithMultiple(addPtrOp, {{newAddPtrOp, fatPtrOffset}});
       fatPtrs[{newAddPtrOp, fatPtrOffset}] =
@@ -629,7 +598,7 @@ public:
             maybeGetOrCreateScalarConstant(rewriter, curLoc, origOffset)) {
       tt::AddPtrOp newAddPtrOp = rewriter.create<tt::AddPtrOp>(
           curLoc, fatPtrBase.getType(), fatPtrBase, *scalarConst);
-      newAddPtrOp->setDiscardableAttrs(propagatedAttrs);
+      doSetDiscardableAttrs(newAddPtrOp);
 
       rewriter.replaceOpWithMultiple(addPtrOp, {{newAddPtrOp, fatPtrOffset}});
       // If we are updating the tensor pointer with a constant value, we can
@@ -646,7 +615,7 @@ public:
 
     auto newAddPtrOp = rewriter.create<tt::AddPtrOp>(
         curLoc, fatPtrBase.getType(), fatPtrBase, uniformOffset);
-    newAddPtrOp->setDiscardableAttrs(propagatedAttrs);
+    doSetDiscardableAttrs(newAddPtrOp);
 
     // Vector offset update (if any): bump the tensor offset
     bool canNarrow = fatPtrs.at({fatPtrBase, fatPtrOffset}).canNarrow;
@@ -1605,9 +1574,6 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
   target.addDynamicallyLegalDialect<scf::SCFDialect>(isLegal);
   target.addDynamicallyLegalDialect<cf::ControlFlowDialect>(isLegal);
   target.addDynamicallyLegalDialect<arith::ArithDialect>(isLegal);
-  // distributed dialect extension
-  target.addDynamicallyLegalDialect<triton::distributed::DistributedDialect>(
-      isLegal);
   target.addDynamicallyLegalDialect<triton::amdgpu::TritonAMDGPUDialect>(
       isLegal);
 
@@ -1622,10 +1588,6 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
   patterns.add<
       ConvertFuncOpArgsUnrealizedCasts, ConvertBroadcastOp, ConvertSplatOp,
       ConvertConvertLayoutOp, ConvertAddPtrOp, ConvertExtractSliceOp,
-      ConvertConsumeToken,
-      // distributed dialect extension
-      MaterializeFatPointer<triton::distributed::WaitOp>,
-      MaterializeFatPointer<triton::distributed::NotifyOp>,
       MaterializeFatPointer<tt::AtomicCASOp>,
       MaterializeFatPointer<tt::AtomicRMWOp>,
       MaterializeFatPointer<tt::BitcastOp>, MaterializeFatPointer<tt::LoadOp>,

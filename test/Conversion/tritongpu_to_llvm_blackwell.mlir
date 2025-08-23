@@ -495,6 +495,7 @@ tt.func public @tmem_message_maxnreg_80(%desc: !ttg.memdesc<128x64xf32, #tmem, #
   tt.return
 }
 
+// CHECK-LABEL: @module_constraint_supercedes_local
 tt.func public @module_constraint_supercedes_local(%desc: !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory>) {
   ttg.warp_specialize(%desc) attributes {actualRegisters = array<i32: 256, 256>}
   default {
@@ -590,6 +591,25 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
       !ttg.memdesc<1xi64, #shared1, #smem>
     tt.return
   }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 1 : i32} {
+// CHECK-LABEL: @tc_gen5_commit
+tt.func @tc_gen5_commit(%arg0: !ttg.memdesc<1xi64, #shared, #smem, mutable>, %pred: i1) {
+  // CHECK: [[ZERO:%.*]] = llvm.mlir.constant(0 : i32)
+  // CHECK: [[IS_WARP_0:%.*]] = llvm.icmp "eq" [[ZERO]], [[ZERO]]
+  // CHECK: [[ELECT:%.*]] = nvvm.elect.sync
+  // CHECK: [[WARP_PRED:%.*]] = llvm.and [[IS_WARP_0]], [[ELECT]]
+  // CHECK: [[PRED:%.*]] = llvm.and %arg1, [[WARP_PRED]]
+  // CHECK: @$0 tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [$1];", "b,l" [[PRED]]
+  ttng.tc_gen5_commit %arg0, %pred : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+  tt.return
+}
 }
 
 // -----

@@ -28,8 +28,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: arrive_barrier
   tt.func @arrive_barrier(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>) {
     // CHECK-NEXT: [[TID:%.*]] = nvvm.read.ptx.sreg.tid.x
+    // CHECK-NEXT: [[C127:%.*]] = llvm.mlir.constant(127 : i32)
+    // CHECK-NEXT: [[RTID:%.*]] = llvm.and [[TID]], [[C127]]
     // CHECK-NEXT: [[C0:%.*]] = llvm.mlir.constant(0 : i32)
-    // CHECK-NEXT: [[IS_ZERO:%.*]] = llvm.icmp "eq" [[TID]], [[C0]]
+    // CHECK-NEXT: [[IS_ZERO:%.*]] = llvm.icmp "eq" [[RTID]], [[C0]]
     // CHECK-NEXT: "@$0 mbarrier.arrive.shared::cta.b64 _, [$1], 2;", "b,r" [[IS_ZERO]], %arg0
     ttng.arrive_barrier %alloc, 2 : !ttg.memdesc<1xi64, #shared0, #smem>
     tt.return
@@ -38,11 +40,35 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: arrive_barrier_pred
   tt.func @arrive_barrier_pred(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>, %pred: i1) {
     // CHECK-NEXT: [[TID:%.*]] = nvvm.read.ptx.sreg.tid.x
+    // CHECK-NEXT: [[C127:%.*]] = llvm.mlir.constant(127 : i32)
+    // CHECK-NEXT: [[RTID:%.*]] = llvm.and [[TID]], [[C127]]
     // CHECK-NEXT: [[C0:%.*]] = llvm.mlir.constant(0 : i32)
-    // CHECK-NEXT: [[IS_ZERO:%.*]] = llvm.icmp "eq" [[TID]], [[C0]]
+    // CHECK-NEXT: [[IS_ZERO:%.*]] = llvm.icmp "eq" [[RTID]], [[C0]]
     // CHECK-NEXT: [[PRED:%.*]] = llvm.and [[IS_ZERO]], %arg1
     // CHECK-NEXT: "@$0 mbarrier.arrive.shared::cta.b64 _, [$1], 2;", "b,r" [[PRED]], %arg0
     ttng.arrive_barrier %alloc, 2, %pred : !ttg.memdesc<1xi64, #shared0, #smem>
+    tt.return
+  }
+
+  // CHECK-LABEL: arrive_barrier_named
+  tt.func @arrive_barrier_named(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>, %pred: i1) {
+    %c9_i32 = arith.constant 9 : i32
+    %c256_i32 = arith.constant 256 : i32
+    // CHECK-NEXT: [[BAR_ID:%.*]] = llvm.mlir.constant(9 : i32) : i32
+    // CHECK-NEXT: [[NUM_THRADS:%.*]] = llvm.mlir.constant(256 : i32) : i32
+    // CHECK-NEXT: "bar.arrive $0, $1;", "r,r" [[BAR_ID]], [[NUM_THRADS]]
+    ttng.arrive_barrier_named %c9_i32, %c256_i32 : i32, i32
+    tt.return
+  }
+
+  // CHECK-LABEL: wait_barrier_named
+  tt.func @wait_barrier_named(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>, %pred: i1) {
+    %c9_i32 = arith.constant 9 : i32
+    %c256_i32 = arith.constant 256 : i32
+    // CHECK-NEXT: [[BAR_ID:%.*]] = llvm.mlir.constant(9 : i32) : i32
+    // CHECK-NEXT: [[NUM_THRADS:%.*]] = llvm.mlir.constant(256 : i32) : i32
+    // CHECK-NEXT: "bar.sync $0, $1;", "r,r" [[BAR_ID]], [[NUM_THRADS]]
+    ttng.wait_barrier_named %c9_i32, %c256_i32 : i32, i32
     tt.return
   }
 }
@@ -178,6 +204,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @tensormap_fenceproxy_acquire(%arg0: !tt.ptr<i8> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     // CHECK: fence.proxy.tensormap::generic.acquire.gpu [ $0 + 0 ], 0x80;
+    // ptxas missing fence workaround:
+    // CHECK: cp.async.bulk.commit_group
+    // CHECK: cp.async.bulk.wait_group.read 0
     ttng.tensormap_fenceproxy_acquire %arg0 : !tt.ptr<i8>
     tt.return
   }

@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 from triton import knobs
 import pytest
+import traceback
 
 from numpy.random import RandomState
 from typing import Optional, Union
@@ -46,8 +47,12 @@ def is_blackwell():
     return is_cuda() and torch.cuda.get_device_capability()[0] == 10
 
 
-def is_hopper():
+def is_hopper_or_newer():
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
+
+
+def is_hopper():
+    return is_cuda() and torch.cuda.get_device_capability()[0] == 9
 
 
 def is_hip():
@@ -195,3 +200,8 @@ def unwrap_tensor(t: Union[torch.Tensor, triton.runtime.jit.TensorWrapper]) -> t
     if isinstance(t, triton.runtime.jit.TensorWrapper):
         return t.base
     return t
+
+
+def format_exception(exceptionInfo: pytest.ExceptionInfo):
+    list_msg = traceback.format_exception(exceptionInfo.type, exceptionInfo.value, exceptionInfo.tb, chain=True)
+    return "\n".join(list_msg)

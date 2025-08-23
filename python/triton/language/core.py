@@ -2044,7 +2044,6 @@ def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_i
     acc = _unwrap_if_constexpr(acc)
     return _semantic.dot(input, other, acc, input_precision, max_num_imprecise_acc, out_dtype)
 
-
 @builtin
 def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None, fast_math=False, lhs_k_pack=True,
                rhs_k_pack=True, out_dtype=float32, _semantic=None):
@@ -3136,6 +3135,22 @@ class static_range:
 
     def __next__(self):
         raise RuntimeError("static_range can only be used in @triton.jit'd functions")
+
+
+class async_task:
+    """
+    Context manager to run code fragments asynchronously.
+    """
+
+    def __init__(self, task_ids, _builder=None):
+        self.task_ids = list({_unwrap_if_constexpr(tid) for tid in task_ids})
+        self.builder = _builder
+
+    def __enter__(self):
+        self.builder.set_async_task_ids(self.task_ids)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.builder.unset_async_task_ids()
 
 
 class range:
