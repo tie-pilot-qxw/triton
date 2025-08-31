@@ -2042,7 +2042,7 @@ def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_i
     out_dtype = _unwrap_if_constexpr(out_dtype)
     max_num_imprecise_acc = _unwrap_if_constexpr(max_num_imprecise_acc)
     acc = _unwrap_if_constexpr(acc)
-    return _semantic.dot(input, other, acc, input_precision, max_num_imprecise_acc, out_dtype)
+    return _semantic.dot(input, other, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype)
 
 @builtin
 def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None, fast_math=False, lhs_k_pack=True,

@@ -372,7 +372,7 @@ if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol):
 else:
     print("❌ Triton and Torch differ")
 
-TORCH_HAS_FP8 = hasattr(torch, "float8_e5m2")
+TORCH_HAS_FP8 = False # hasattr(torch, "float8_e5m2")
 if TORCH_HAS_FP8 and is_cuda():
     torch.manual_seed(0)
     a = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)

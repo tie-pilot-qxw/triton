@@ -1048,11 +1048,11 @@ class TritonSemantic(Generic[TensorTy]):
         if is_bool:
             elt_ty = tl.int8
             ptr_ty = tl.pointer_type(elt_ty, ptr_ty.address_space)
-            ptr = self.cast(ptr, ptr_ty, self.builder)
+            ptr = self.cast(ptr, ptr_ty)
     
         # Cast `other` into `elt_ty` type
         if other is not None:
-            other = self.cast(other, elt_ty, self.builder)
+            other = self.cast(other, elt_ty)
     
         # Create loaded result type `dst_ty`
         if ptr.type.is_block():
@@ -1571,7 +1571,7 @@ class TritonSemantic(Generic[TensorTy]):
                 raise ValueError(f"max_num_imprecise_acc ({max_num_imprecise_acc}) must be <= K ({K})")
         return (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc, ret_ty)
     
-    def dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], allow_tf32, max_num_imprecise_acc: int,
+    def dot(self, lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], allow_tf32, max_num_imprecise_acc: int,
             out_dtype: tl.dtype) -> tl.tensor:
         (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc,
          ret_ty) = self.dot_precheck(lhs, rhs, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype)
