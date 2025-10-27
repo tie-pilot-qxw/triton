@@ -677,12 +677,12 @@ try:
 except BaseException:
     HAS_FLASH = False
 
-TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
+TORCH_HAS_FP8 = False # hasattr(torch, 'float8_e5m2')
 BATCH, N_HEADS = 4, 32
 # vary seq length for fixed head and batch=4
 configs = []
-for HEAD_DIM in [64, 128]:
-    for mode in ["fwd", "bwd"]:
+for HEAD_DIM in [128]:
+    for mode in ["fwd"]:
         for causal in [True, False]:
             for warp_specialize in [False, True] if is_blackwell() else [False]:
                 configs.append(

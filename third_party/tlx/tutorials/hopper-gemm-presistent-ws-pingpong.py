@@ -9,7 +9,11 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
-M, N, K = (8192, 8192, 8192)# (2176, 2176, 2176)
+# M, N, K = (8192, 8192, 8192)# (2176, 2176, 2176)
+
+M=16384
+N=12288
+K=6144
 
 
 def is_cuda():
@@ -33,7 +37,7 @@ def matmul_tma_set_block_size_hook(nargs):
     BLOCK_K = nargs["BK"]
     NUM_MMA_GROUPS = nargs["NUM_MMA_GROUPS"]
     nargs["a_desc"].block_shape = [BLOCK_M, BLOCK_K]
-    nargs["b_desc"].block_shape = [BLOCK_K, BLOCK_N]
+    nargs["b_desc"].block_shape = [BLOCK_N, BLOCK_K]
     EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", False)
     if EPILOGUE_SUBTILE:
         nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
@@ -49,11 +53,11 @@ def matmul_get_configs():
                 "NUM_MMA_GROUPS": 2,
                 "EPILOGUE_SUBTILE": epi_subtile,}, 
                       num_stages=1, num_warps=4, pre_hook=matmul_tma_set_block_size_hook) \
-        for BM in [128] \
-        for BN in [128] \
-        for BK in [64] \
-        for num_stage in [5]
-        for epi_subtile in [True]
+        for BM in [128, 64, 256] \
+        for BN in [128, 256] \
+        for BK in [64, 128] \
+        for num_stage in [2, 3, 4, 5, 6]
+        for epi_subtile in [True, False]
     ]
 
 @triton.jit
@@ -83,7 +87,7 @@ def matmul_kernel_tlx_ws_persistent(
     EPILOGUE_SUBTILE: tl.constexpr,
 ):
     a = tlx.local_alloc((BM, BK), tlx.dtype_of(a_desc), NUM_STAGES)
-    b = tlx.local_alloc((BK, BN), tlx.dtype_of(b_desc), NUM_STAGES)
+    b = tlx.local_alloc((BN, BK), tlx.dtype_of(b_desc), NUM_STAGES)
 
     # Mainloop Barriers: For producer-consumer synchronization on A and B buffers.
     # The producer waits on empty, consumers wait on full.
@@ -125,7 +129,7 @@ def matmul_kernel_tlx_ws_persistent(
                     data_a = tlx.local_view(a, buf)
                     tlx.async_descriptor_load(a_desc, data_a, [offset_am, offset_k], full)
                     data_b = tlx.local_view(b, buf)
-                    tlx.async_descriptor_load(b_desc, data_b, [offset_k, offset_bn], full)
+                    tlx.async_descriptor_load(b_desc, data_b, [offset_bn, offset_k], full)
 
                     p = p ^ (buf == (NUM_STAGES - 1))
                     buf = (buf + 1) % NUM_STAGES
@@ -143,6 +147,8 @@ def matmul_kernel_tlx_ws_persistent(
             tile_rank = cid # cta0: 0, 2, 4 cta1; 1, 3, 5
             phase_math = 1 - cid
 
+            acc = tl.zeros([BM, BN], dtype=tl.float32)
+
             for tile_id in range(start_pid, num_tiles, NUM_SMS * 2):
                 total_k_offset = tile_rank * k_tiles
                 tile_rank += 2
@@ -150,17 +156,6 @@ def matmul_kernel_tlx_ws_persistent(
                 p = (total_k_offset // NUM_STAGES) % 2
 
                 last_buf = buf
-
-                group_id = tile_id // num_pid_in_group
-                first_pid_m = group_id * GROUP_SIZE_M
-                group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-                pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
-                pid_n = (tile_id % num_pid_in_group) // group_size_m
-                
-                offset_am = pid_m * BM
-                offset_bn = pid_n * BN
-
-                acc = tl.zeros([BM, BN], dtype=tl.float32)
 
                 # wait ping-pong barrier
                 mma_bar = tlx.local_view(pingpong_mma_bar, cid) # wait 
@@ -172,6 +167,7 @@ def matmul_kernel_tlx_ws_persistent(
 
                 data_a = tlx.local_view(a, buf)
                 data_b = tlx.local_view(b, buf)
+                data_b = tlx.local_trans(data_b) # transpose B
 
                 acc = tlx.async_dot(data_a, data_b, acc)
 
@@ -184,6 +180,7 @@ def matmul_kernel_tlx_ws_persistent(
 
                     data_a = tlx.local_view(a, buf)
                     data_b = tlx.local_view(b, buf)
+                    data_b = tlx.local_trans(data_b) # transpose B
 
                     acc = tlx.async_dot(data_a, data_b, acc)
 
@@ -205,6 +202,15 @@ def matmul_kernel_tlx_ws_persistent(
                 epi_bar = tlx.local_view(pingpong_epi_bar, cid)
                 tlx.barrier_wait(bar=epi_bar, phase=phase_math)
 
+                group_id = tile_id // num_pid_in_group
+                first_pid_m = group_id * GROUP_SIZE_M
+                group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+                pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+                pid_n = (tile_id % num_pid_in_group) // group_size_m
+                
+                offset_am = pid_m * BM
+                offset_bn = pid_n * BN
+
                 offset_cm = offset_am
                 if EPILOGUE_SUBTILE:
                     acc = tl.reshape(acc, (BM, 2, BN // 2))
@@ -217,23 +223,24 @@ def matmul_kernel_tlx_ws_persistent(
                 else:
                     c_desc.store([offset_cm, offset_bn], acc.to(tlx.dtype_of(c_desc)))
 
+                acc = tl.zeros([BM, BN], dtype=tl.float32)
                 peer_epi = tlx.local_view(pingpong_epi_bar, 1 - cid)
                 tlx.barrier_arrive(peer_epi) # release peer epi bar
                 phase_math = 1 - phase_math
 
 def matmul_tlx_ws_persistent(a, b, profile=False):
     # Check constraints.
-    assert a.shape[1] == b.shape[0], "Illegal dimensions of input operands"
+    assert a.shape[1] == b.shape[1], "Illegal dimensions of input operands"
     assert a.is_contiguous(), "Matrix A must be contiguous"
 
-    (M, N, K) = (a.shape[0], b.shape[1], a.shape[1])
+    (M, N, K) = (a.shape[0], b.shape[0], a.shape[1])
     c = torch.zeros((M, N), dtype=torch.float16, device=DEVICE)
 
     NUM_SMS = torch.cuda.get_device_properties(DEVICE).multi_processor_count
 
     dummy_block = [1, 1]
     desc_in_1 = TensorDescriptor(a, shape=[M, K], strides=[K, 1], block_shape=dummy_block)
-    desc_in_2 = TensorDescriptor(b, shape=[K, N], strides=[N, 1], block_shape=dummy_block)
+    desc_in_2 = TensorDescriptor(b, shape=[N, K], strides=[K, 1], block_shape=dummy_block)
     desc_out = TensorDescriptor(c, shape=[M, N], strides=[N, 1], block_shape=dummy_block)
 
     def grid(META):
@@ -259,15 +266,13 @@ def test_op():
     torch.manual_seed(0)
 
     a = torch.randn((M, K), dtype=torch.float16, device=DEVICE)
-    b = torch.randn((K, N), dtype=torch.float16, device=DEVICE)
+    b = torch.randn((N, K), dtype=torch.float16, device=DEVICE)
 
     rtol = 1e-2 if is_hip_cdna2() else 0
     output = matmul_tlx_ws_persistent(a, b,)
-    output_ref = torch.matmul(a, b)
+    output_ref = torch.matmul(a, b.T)
 
     torch.allclose(output, output_ref, atol=1e-2, rtol=rtol)
-
-    output = matmul_tlx_ws_persistent(a, b, True)
     
     print(f"Test passed!")
 
@@ -298,23 +303,27 @@ for fp8_inputs in [False, True]:
 
 @triton.testing.perf_report(configs)
 def benchmark(M, N, K, provider, fp8_inputs):
+    M=16384
+    N=12288
+    K=6144
     a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
-    b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((N, K), device=DEVICE, dtype=torch.float16)
     if TORCH_HAS_FP8 and fp8_inputs:
         a = a.to(torch.float8_e5m2)
         b = b.T
         b = b.to(torch.float8_e5m2)
     quantiles = [0.5, 0.2, 0.8]
     if provider == ref_lib.lower():
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles, warmup=200, rep=200)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b.T), quantiles=quantiles, warmup=200, rep=200)
     if provider == 'triton':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_tlx_ws_persistent(a, b), quantiles=quantiles, warmup=200, rep=200)
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
+    print(f"{provider} {M}x{N}x{K} {perf(ms):.2f} TFLOPS")
     return perf(ms), perf(max_ms), perf(min_ms)
 
 
 if __name__ == "__main__":
-    test_op()
+    # test_op()
     if is_cuda() and torch.cuda.get_device_capability()[0] == 9:
         print("Running benchmarks...")
         benchmark.run(show_plots=True, print_data=True, diff_col=True)
